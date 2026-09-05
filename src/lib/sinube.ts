@@ -111,6 +111,27 @@ export async function workReport(connection: Connection, from: string, to: strin
       events.push({ folioOrden: order.folioOrden, usuario: order.usuarioCreo.replaceAll("\\@", "@"), fechaHora: formatted, fuente: "Creación OP", producto: order.producto ?? undefined, descripcion: order.descripcion?.replaceAll("&DiagonalSiNube;", "/") ?? undefined });
     });
   }
+
+  // An OP can have activity on a later day than its creation date. Fetch its
+  // master record by folio so bitácora rows also receive product/description.
+  const detailsByFolio = new Map<string, Pick<WorkEvent, "producto" | "descripcion">>();
+  for (const folioOrden of new Set(events.map((event) => event.folioOrden).filter(Boolean))) {
+    if (!/^\d+$/.test(folioOrden)) continue;
+    const details = await queryAll(
+      connection,
+      `SELECT folioOrden, producto, descripcion, fechaCreacion, usuarioCreo, fechaModifico, usuarioModifico FROM DbOrdenProduccion WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND folioOrden = ${folioOrden}`,
+    );
+    const order = details[0];
+    if (order) detailsByFolio.set(folioOrden, {
+      producto: order.producto ?? undefined,
+      descripcion: order.descripcion?.replaceAll("&DiagonalSiNube;", "/") ?? undefined,
+    });
+  }
+
+  events.forEach((event, index) => {
+    const details = detailsByFolio.get(event.folioOrden);
+    if (details) events[index] = { ...event, ...details };
+  });
   const merged = new Map<string, WorkEvent>();
   events.forEach((event) => {
     const key = `${event.folioOrden}|${event.usuario}|${event.fechaHora}`;
