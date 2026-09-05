@@ -8,7 +8,10 @@ const ROW = "¬";
 const ZONE = "America/Mexico_City";
 
 function endpoint(site: Connection["site"]) {
-  return site === "facturanube" ? "https://getpost.facturanube.appspot.com/getpost" : "https://getpost.si-nube.appspot.com/getpost";
+  // SiNube's current HTTPS certificate does not match its Appspot hostname.
+  // The documented POST endpoint is therefore called over HTTP until SiNube
+  // restores a valid certificate for this hostname.
+  return site === "facturanube" ? "http://getpost.facturanube.appspot.com/getpost" : "http://getpost.si-nube.appspot.com/getpost";
 }
 
 function sqlString(value: string) {
