@@ -1,7 +1,18 @@
 import { Connection } from "./catalog";
 
 type Row = Record<string, string | null>;
-export type WorkEvent = { folioOrden: string; usuario: string; fechaHora: string; fuente: "Bitácora" | "Creación OP"; producto?: string; descripcion?: string };
+type PalletAllocation = { pallet: string; cantidadAsignada: number; cantidadLote: number };
+export type WorkEvent = {
+  folioOrden: string;
+  usuario: string;
+  fechaHora: string;
+  fuente: "Bitácora" | "Creación OP";
+  producto?: string;
+  descripcion?: string;
+  folioAlmEntrada?: string;
+  cantidadBitacora?: number;
+  pallets?: PalletAllocation[];
+};
 
 const NULL = "&NullSiNube;";
 const ROW = "¬";
@@ -76,16 +87,42 @@ function parseLogDate(value: string) {
   return { label: normalized, date: new Date(Date.UTC(2000 + Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second))), day: `20${year}-${month}-${day}`, time: `${hour}:${minute}` };
 }
 
-function logEvents(folioOrden: string, bitacora: string | null, fromDate: string, toDate: string, fromHour: string, toHour: string): WorkEvent[] {
+function logEvents(folioOrden: string, folioAlmEntrada: string | null, bitacora: string | null, fromDate: string, toDate: string, fromHour: string, toHour: string): WorkEvent[] {
   if (!bitacora) return [];
   return bitacora.split("&PipeSiNube;").flatMap((item) => {
-    const [rawDate, rawUser] = item.split(",");
+    const [rawDate, rawUser, rawQuantity] = item.split(",");
     const parsed = rawDate && parseLogDate(rawDate);
     // The bitácora timestamp, not the OP creation timestamp, determines whether
     // a warehouse event belongs to the selected date range.
     if (!parsed || !rawUser || parsed.day < fromDate || parsed.day > toDate) return [];
     const inRange = fromHour <= toHour ? parsed.time >= fromHour && parsed.time <= toHour : parsed.time >= fromHour || parsed.time <= toHour;
-    return inRange ? [{ folioOrden, usuario: rawUser.replaceAll("\\@", "@"), fechaHora: parsed.label, fuente: "Bitácora" as const }] : [];
+    const cantidadBitacora = Number(rawQuantity);
+    return inRange ? [{
+      folioOrden,
+      folioAlmEntrada: folioAlmEntrada ?? undefined,
+      usuario: rawUser.replaceAll("\\@", "@"),
+      fechaHora: parsed.label,
+      fuente: "Bitácora" as const,
+      cantidadBitacora: Number.isFinite(cantidadBitacora) ? cantidadBitacora : undefined,
+    }] : [];
+  });
+}
+
+function palletAllocations(details: Row[], requestedQuantity: number) {
+  let remaining = requestedQuantity;
+  const pallets = details.flatMap((detail) => {
+    const lotes = detail.lotes?.split(",") ?? [];
+    const pallet = lotes.at(-1)?.trim() ?? "";
+    const cantidadLote = Number(detail.cantidad);
+    const palletNumber = Number(pallet);
+    return pallet && Number.isFinite(cantidadLote) ? [{ pallet, palletNumber: Number.isFinite(palletNumber) ? palletNumber : -1, cantidadLote }] : [];
+  }).sort((a, b) => b.palletNumber - a.palletNumber || b.pallet.localeCompare(a.pallet));
+
+  return pallets.flatMap(({ pallet, cantidadLote }) => {
+    if (remaining <= 0) return [];
+    const cantidadAsignada = Math.min(remaining, cantidadLote);
+    remaining -= cantidadAsignada;
+    return [{ pallet, cantidadAsignada, cantidadLote }];
   });
 }
 
@@ -101,10 +138,10 @@ export async function workReport(connection: Connection, from: string, to: strin
   for (const day of days) {
     const filter = `empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND dia = ${dayNumber(day)}`;
     const [entries, orders] = await Promise.all([
-      queryAll(connection, `SELECT folioOrden, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE ${filter} AND tipo = 5`),
+      queryAll(connection, `SELECT folioOrden, folioAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE ${filter} AND tipo = 5`),
       queryAll(connection, `SELECT folioOrden, producto, descripcion, fechaCreacion, usuarioCreo FROM DbOrdenProduccion WHERE ${filter}`),
     ]);
-    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.bitacoraCantidadAdicional, from, to, fromHour, toHour)));
+    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.folioAlmEntrada, entry.bitacoraCantidadAdicional, from, to, fromHour, toHour)));
     orders.forEach((order) => {
       const date = order.fechaCreacion && formattedOrderDate(order.fechaCreacion);
       if (!date || !order.usuarioCreo || !order.folioOrden || !inTimeRange(date, fromHour, toHour)) return;
@@ -133,9 +170,24 @@ export async function workReport(connection: Connection, from: string, to: strin
     const details = detailsByFolio.get(event.folioOrden);
     if (details) events[index] = { ...event, ...details };
   });
+
+  const lotesByEntrada = new Map<string, Row[]>();
+  for (const folioAlmEntrada of new Set(events.map((event) => event.folioAlmEntrada).filter((folio): folio is string => Boolean(folio)))) {
+    if (!/^\d+$/.test(folioAlmEntrada)) continue;
+    lotesByEntrada.set(
+      folioAlmEntrada,
+      await queryAll(connection, `SELECT folioAlmEntrada, producto, cantidad, lotes FROM DbAlmEntradaDetLote WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND folioAlmEntrada = ${folioAlmEntrada}`),
+    );
+  }
+
+  events.forEach((event, index) => {
+    if (!event.folioAlmEntrada || event.cantidadBitacora === undefined) return;
+    const details = lotesByEntrada.get(event.folioAlmEntrada);
+    if (details) events[index] = { ...event, pallets: palletAllocations(details, event.cantidadBitacora) };
+  });
   const merged = new Map<string, WorkEvent>();
   events.forEach((event) => {
-    const key = `${event.folioOrden}|${event.usuario}|${event.fechaHora}`;
+    const key = `${event.folioOrden}|${event.folioAlmEntrada ?? ""}|${event.usuario}|${event.fechaHora}|${event.cantidadBitacora ?? ""}`;
     const previous = merged.get(key);
     merged.set(key, previous ? { ...previous, fuente: previous.fuente === event.fuente ? event.fuente : "Bitácora" } : event);
   });
