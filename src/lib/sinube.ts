@@ -76,12 +76,14 @@ function parseLogDate(value: string) {
   return { label: normalized, date: new Date(Date.UTC(2000 + Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second))), day: `20${year}-${month}-${day}`, time: `${hour}:${minute}` };
 }
 
-function logEvents(folioOrden: string, bitacora: string | null, selectedDays: Set<string>, fromHour: string, toHour: string): WorkEvent[] {
+function logEvents(folioOrden: string, bitacora: string | null, fromDate: string, toDate: string, fromHour: string, toHour: string): WorkEvent[] {
   if (!bitacora) return [];
   return bitacora.split("&PipeSiNube;").flatMap((item) => {
     const [rawDate, rawUser] = item.split(",");
     const parsed = rawDate && parseLogDate(rawDate);
-    if (!parsed || !rawUser || !selectedDays.has(parsed.day)) return [];
+    // The bitácora timestamp, not the OP creation timestamp, determines whether
+    // a warehouse event belongs to the selected date range.
+    if (!parsed || !rawUser || parsed.day < fromDate || parsed.day > toDate) return [];
     const inRange = fromHour <= toHour ? parsed.time >= fromHour && parsed.time <= toHour : parsed.time >= fromHour || parsed.time <= toHour;
     return inRange ? [{ folioOrden, usuario: rawUser.replaceAll("\\@", "@"), fechaHora: parsed.label, fuente: "Bitácora" as const }] : [];
   });
@@ -95,7 +97,6 @@ function formattedOrderDate(value: string) {
 export async function workReport(connection: Connection, from: string, to: string, fromHour: string, toHour: string) {
   if (!/^\d{2}:\d{2}$/.test(fromHour) || !/^\d{2}:\d{2}$/.test(toHour)) throw new Error("Las horas no son válidas.");
   const days = datesBetween(from, to);
-  const selectedDays = new Set(days);
   const events: WorkEvent[] = [];
   for (const day of days) {
     const filter = `empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND dia = ${dayNumber(day)}`;
@@ -103,7 +104,7 @@ export async function workReport(connection: Connection, from: string, to: strin
       queryAll(connection, `SELECT folioOrden, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE ${filter} AND tipo = 5`),
       queryAll(connection, `SELECT folioOrden, producto, descripcion, fechaCreacion, usuarioCreo FROM DbOrdenProduccion WHERE ${filter}`),
     ]);
-    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.bitacoraCantidadAdicional, selectedDays, fromHour, toHour)));
+    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.bitacoraCantidadAdicional, from, to, fromHour, toHour)));
     orders.forEach((order) => {
       const date = order.fechaCreacion && formattedOrderDate(order.fechaCreacion);
       if (!date || !order.usuarioCreo || !order.folioOrden || !inTimeRange(date, fromHour, toHour)) return;
