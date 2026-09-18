@@ -280,7 +280,9 @@ export async function workReport(connection: Connection, from: string, to: strin
     const details = await queryAll(connection, `SELECT folioAlmEntrada, producto, cantidad, lotes FROM DbAlmEntradaDetLote WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND folioAlmEntrada = ${folioAlmEntrada}`);
     const initialLots = allocateLots(details, logLines);
     events.push(...selectedLines.map(({ timestamp: _timestamp, enRango: _enRango, ...event }) => ({ ...event, ...detailsByFolio.get(event.folioOrden) })));
-    if (includeInitialEntry || selectedLines.length) {
+    // The original entry is a separate dated event. Do not show it merely
+    // because a later bitácora addition was selected.
+    if (includeInitialEntry) {
       const details = entry && detailsByFolio.get(entry.folioOrden);
       events.push({
         folioOrden: entry?.folioOrden ?? "",
