@@ -25,7 +25,7 @@ npm run dev
 
 1. Sube esta carpeta a un repositorio de GitHub.
 2. Importa el repositorio desde Vercel.
-3. Crea las variables de entorno de `.env.example` en Vercel. `SINUBE_CONNECTIONS` es un secreto y debe contener las credenciales de comunicación.
+3. Crea las variables de entorno de `.env.example` en Vercel. Define la contraseña común en `SINUBE_COMMUNICATION_PASSWORD` y el catálogo de RFC/sucursales en `SINUBE_CONNECTIONS`.
 4. Despliega. Vercel detectará Next.js automáticamente.
 
 ## Notas operativas
