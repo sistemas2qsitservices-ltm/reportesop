@@ -184,6 +184,20 @@ function formatEntryDate(value: string | null) {
   return new Intl.DateTimeFormat("es-MX", { timeZone: ZONE, dateStyle: "short", timeStyle: "medium" }).format(date);
 }
 
+function localDay(date: Date) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  return year && month && day ? `${year}-${month}-${day}` : "";
+}
+
+function isEntryInRange(value: string | null, from: string, to: string, fromHour: string, toHour: string) {
+  if (!value) return false;
+  const date = formattedOrderDate(value);
+  return Boolean(date && localDay(date) >= from && localDay(date) <= to && inTimeRange(date, fromHour, toHour));
+}
+
 function formattedOrderDate(value: string) {
   const date = new Date(Number(value));
   return Number.isNaN(+date) ? null : date;
@@ -196,23 +210,22 @@ export async function workReport(connection: Connection, from: string, to: strin
   const entriesByFolio = new Map<string, Entry>();
   const allLogEventsByEntrada = new Map<string, InternalLogEvent[]>();
 
-  // Fetch warehouse entries by month, then filter each bitácora line by its
-  // own embedded date/time. An entry can be created on a different day than
-  // the work event recorded in bitacoraCantidadAdicional.
-  const months = new Set(days.map((day) => day.slice(0, 7).replace("-", "")));
-  for (const month of months) {
-    const entries = await queryAll(
-      connection,
-      `SELECT folioOrden, folioAlmEntrada, fechaAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5 AND mes = ${month}`,
-    );
-    entries.forEach((entry) => {
-      if (!entry.folioAlmEntrada || !entry.folioOrden) return;
-      const typedEntry = entry as Entry;
-      entriesByFolio.set(typedEntry.folioAlmEntrada, typedEntry);
-      const logLines = logEvents(typedEntry.folioOrden, typedEntry.folioAlmEntrada, typedEntry.bitacoraCantidadAdicional, from, to, fromHour, toHour);
-      allLogEventsByEntrada.set(typedEntry.folioAlmEntrada, logLines);
-    });
-  }
+  // The event date is encoded inside bitacoraCantidadAdicional, not indexed in
+  // a DbAlmEntrada day/month field. Therefore entries cannot be restricted to
+  // the selected entry month: an entry from the 15th can contain an addition on
+  // the 17th (or even in a later month). The resulting log lines are filtered
+  // below using their own embedded timestamp.
+  const entries = await queryAll(
+    connection,
+    `SELECT folioOrden, folioAlmEntrada, fechaAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5`,
+  );
+  entries.forEach((entry) => {
+    if (!entry.folioAlmEntrada || !entry.folioOrden) return;
+    const typedEntry = entry as Entry;
+    entriesByFolio.set(typedEntry.folioAlmEntrada, typedEntry);
+    const logLines = logEvents(typedEntry.folioOrden, typedEntry.folioAlmEntrada, typedEntry.bitacoraCantidadAdicional, from, to, fromHour, toHour);
+    allLogEventsByEntrada.set(typedEntry.folioAlmEntrada, logLines);
+  });
 
   for (const day of days) {
     const filter = `empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND dia = ${dayNumber(day)}`;
@@ -230,7 +243,10 @@ export async function workReport(connection: Connection, from: string, to: strin
   const detailsByFolio = new Map<string, Pick<WorkEvent, "producto" | "descripcion">>();
   const foliosConActividad = [
     ...events.map((event) => event.folioOrden),
-    ...[...allLogEventsByEntrada.values()].flatMap((logLines) => logLines.map((event) => event.folioOrden)),
+    ...[...allLogEventsByEntrada.entries()].flatMap(([folioAlmEntrada, logLines]) => {
+      const entry = entriesByFolio.get(folioAlmEntrada);
+      return logLines.some((event) => event.enRango) || isEntryInRange(entry?.fechaAlmEntrada ?? null, from, to, fromHour, toHour) ? [entry?.folioOrden ?? ""] : [];
+    }),
   ];
   for (const folioOrden of new Set(foliosConActividad.filter(Boolean))) {
     if (!/^\d+$/.test(folioOrden)) continue;
@@ -255,12 +271,13 @@ export async function workReport(connection: Connection, from: string, to: strin
   // belongs to a newer one. Output only the lines selected by the user.
   for (const [folioAlmEntrada, logLines] of allLogEventsByEntrada) {
     const selectedLines = logLines.filter((event) => event.enRango);
-    if (!selectedLines.length || !/^\d+$/.test(folioAlmEntrada)) continue;
+    const entry = entriesByFolio.get(folioAlmEntrada);
+    const includeInitialEntry = isEntryInRange(entry?.fechaAlmEntrada ?? null, from, to, fromHour, toHour);
+    if ((!selectedLines.length && !includeInitialEntry) || !/^\d+$/.test(folioAlmEntrada)) continue;
     const details = await queryAll(connection, `SELECT folioAlmEntrada, producto, cantidad, lotes FROM DbAlmEntradaDetLote WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND folioAlmEntrada = ${folioAlmEntrada}`);
     const initialLots = allocateLots(details, logLines);
     events.push(...selectedLines.map(({ timestamp: _timestamp, enRango: _enRango, ...event }) => ({ ...event, ...detailsByFolio.get(event.folioOrden) })));
-    if (initialLots.length) {
-      const entry = entriesByFolio.get(folioAlmEntrada);
+    if (includeInitialEntry || selectedLines.length) {
       const details = entry && detailsByFolio.get(entry.folioOrden);
       events.push({
         folioOrden: entry?.folioOrden ?? "",
@@ -269,7 +286,7 @@ export async function workReport(connection: Connection, from: string, to: strin
         fechaHora: formatEntryDate(entry?.fechaAlmEntrada ?? null),
         fuente: "Entrada inicial",
         cantidadBitacora: initialLots.reduce((total, lot) => total + lot.cantidadAsignada, 0),
-        lotes: initialLots,
+        lotes: initialLots.length ? initialLots : undefined,
         ...details,
       });
     }
