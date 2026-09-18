@@ -107,7 +107,10 @@ function logEvents(folioOrden: string, folioAlmEntrada: string | null, bitacora:
     if (!parsed || !rawUser) return [];
     const inRange = fromHour <= toHour ? parsed.time >= fromHour && parsed.time <= toHour : parsed.time >= fromHour || parsed.time <= toHour;
     const cantidadBitacora = Number(rawQuantity);
-    return inRange ? [{
+    // Keep every valid history line for pallet allocation. enRango controls
+    // presentation only: excluding older lines here would make their pallets
+    // incorrectly appear again as part of the original entry.
+    return [{
       folioOrden,
       folioAlmEntrada: folioAlmEntrada ?? undefined,
       usuario: rawUser.replaceAll("\\@", "@"),
@@ -116,7 +119,7 @@ function logEvents(folioOrden: string, folioAlmEntrada: string | null, bitacora:
       cantidadBitacora: Number.isFinite(cantidadBitacora) ? cantidadBitacora : undefined,
       timestamp: parsed.date.getTime(),
       enRango: parsed.day >= fromDate && parsed.day <= toDate && inRange,
-    }] : [];
+    }];
   });
 }
 
