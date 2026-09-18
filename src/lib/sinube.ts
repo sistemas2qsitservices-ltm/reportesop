@@ -1,18 +1,28 @@
 import { Connection } from "./catalog";
 
 type Row = Record<string, string | null>;
-type PalletAllocation = { pallet: string; cantidadAsignada: number; cantidadLote: number };
+type LotAllocation = {
+  loteNivel1: string;
+  opNivel2: string;
+  idTarimaNivel3: string;
+  palletNivel4: string;
+  cantidadAsignada: number;
+  cantidadLote: number;
+};
 export type WorkEvent = {
   folioOrden: string;
   usuario: string;
   fechaHora: string;
-  fuente: "Bitácora" | "Creación OP";
+  fuente: "Bitácora" | "Creación OP" | "Entrada inicial";
   producto?: string;
   descripcion?: string;
   folioAlmEntrada?: string;
   cantidadBitacora?: number;
-  pallets?: PalletAllocation[];
+  lotes?: LotAllocation[];
 };
+
+type InternalLogEvent = WorkEvent & { timestamp: number; enRango: boolean };
+type Entry = Row & { folioAlmEntrada: string; folioOrden: string };
 
 const NULL = "&NullSiNube;";
 const ROW = "¬";
@@ -87,14 +97,14 @@ function parseLogDate(value: string) {
   return { label: normalized, date: new Date(Date.UTC(2000 + Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second))), day: `20${year}-${month}-${day}`, time: `${hour}:${minute}` };
 }
 
-function logEvents(folioOrden: string, folioAlmEntrada: string | null, bitacora: string | null, fromDate: string, toDate: string, fromHour: string, toHour: string): WorkEvent[] {
+function logEvents(folioOrden: string, folioAlmEntrada: string | null, bitacora: string | null, fromDate: string, toDate: string, fromHour: string, toHour: string): InternalLogEvent[] {
   if (!bitacora) return [];
   return bitacora.split("&PipeSiNube;").flatMap((item) => {
     const [rawDate, rawUser, rawQuantity] = item.split(",");
     const parsed = rawDate && parseLogDate(rawDate);
     // The bitácora timestamp, not the OP creation timestamp, determines whether
     // a warehouse event belongs to the selected date range.
-    if (!parsed || !rawUser || parsed.day < fromDate || parsed.day > toDate) return [];
+    if (!parsed || !rawUser) return [];
     const inRange = fromHour <= toHour ? parsed.time >= fromHour && parsed.time <= toHour : parsed.time >= fromHour || parsed.time <= toHour;
     const cantidadBitacora = Number(rawQuantity);
     return inRange ? [{
@@ -104,26 +114,74 @@ function logEvents(folioOrden: string, folioAlmEntrada: string | null, bitacora:
       fechaHora: parsed.label,
       fuente: "Bitácora" as const,
       cantidadBitacora: Number.isFinite(cantidadBitacora) ? cantidadBitacora : undefined,
+      timestamp: parsed.date.getTime(),
+      enRango: parsed.day >= fromDate && parsed.day <= toDate && inRange,
     }] : [];
   });
 }
 
-function palletAllocations(details: Row[], requestedQuantity: number) {
-  let remaining = requestedQuantity;
-  const pallets = details.flatMap((detail) => {
-    const lotes = detail.lotes?.split(",") ?? [];
-    const pallet = lotes.at(-1)?.trim() ?? "";
-    const cantidadLote = Number(detail.cantidad);
-    const palletNumber = Number(pallet);
-    return pallet && Number.isFinite(cantidadLote) ? [{ pallet, palletNumber: Number.isFinite(palletNumber) ? palletNumber : -1, cantidadLote }] : [];
-  }).sort((a, b) => b.palletNumber - a.palletNumber || b.pallet.localeCompare(a.pallet));
+function removeLevelPrefix(value: string, level: string) {
+  const trimmed = value.trim();
+  return trimmed.startsWith(level) ? trimmed.slice(1) : trimmed;
+}
 
-  return pallets.flatMap(({ pallet, cantidadLote }) => {
-    if (remaining <= 0) return [];
-    const cantidadAsignada = Math.min(remaining, cantidadLote);
-    remaining -= cantidadAsignada;
-    return [{ pallet, cantidadAsignada, cantidadLote }];
-  });
+function lotsFromDetails(details: Row[]) {
+  return details.flatMap((detail) => {
+    const levels = detail.lotes?.split(",") ?? [];
+    const cantidadLote = Number(detail.cantidad);
+    if (levels.length < 4 || !Number.isFinite(cantidadLote)) return [];
+    const palletNivel4 = removeLevelPrefix(levels[3], "4");
+    const palletNumber = Number(palletNivel4);
+    return [{
+      loteNivel1: removeLevelPrefix(levels[0], "1"),
+      opNivel2: removeLevelPrefix(levels[1], "2"),
+      idTarimaNivel3: removeLevelPrefix(levels[2], "3"),
+      palletNivel4,
+      palletNumber: Number.isFinite(palletNumber) ? palletNumber : -1,
+      cantidadLote,
+    }];
+  }).sort((a, b) => b.palletNumber - a.palletNumber || b.palletNivel4.localeCompare(a.palletNivel4));
+}
+
+function allocateLots(details: Row[], entryEvents: InternalLogEvent[]) {
+  const available = lotsFromDetails(details).map((lot) => ({ ...lot, disponible: lot.cantidadLote }));
+  // A bitácora amount is assigned only once. Going from newest to oldest and
+  // from highest to lowest pallet leaves the unlinked balance as the initial entry.
+  for (const event of [...entryEvents].sort((a, b) => b.timestamp - a.timestamp)) {
+    let remaining = event.cantidadBitacora ?? 0;
+    const assigned: LotAllocation[] = [];
+    for (const lot of available) {
+      if (remaining <= 0) break;
+      if (lot.disponible <= 0) continue;
+      const cantidadAsignada = Math.min(remaining, lot.disponible);
+      lot.disponible -= cantidadAsignada;
+      remaining -= cantidadAsignada;
+      assigned.push({
+        loteNivel1: lot.loteNivel1,
+        opNivel2: lot.opNivel2,
+        idTarimaNivel3: lot.idTarimaNivel3,
+        palletNivel4: lot.palletNivel4,
+        cantidadAsignada,
+        cantidadLote: lot.cantidadLote,
+      });
+    }
+    event.lotes = assigned;
+  }
+  return available.filter((lot) => lot.disponible > 0).map((lot) => ({
+    loteNivel1: lot.loteNivel1,
+    opNivel2: lot.opNivel2,
+    idTarimaNivel3: lot.idTarimaNivel3,
+    palletNivel4: lot.palletNivel4,
+    cantidadAsignada: lot.disponible,
+    cantidadLote: lot.cantidadLote,
+  }));
+}
+
+function formatEntryDate(value: string | null) {
+  if (!value) return "Entrada inicial";
+  const date = new Date(Number(value));
+  if (Number.isNaN(+date)) return value;
+  return new Intl.DateTimeFormat("es-MX", { timeZone: ZONE, dateStyle: "short", timeStyle: "medium" }).format(date);
 }
 
 function formattedOrderDate(value: string) {
@@ -135,6 +193,8 @@ export async function workReport(connection: Connection, from: string, to: strin
   if (!/^\d{2}:\d{2}$/.test(fromHour) || !/^\d{2}:\d{2}$/.test(toHour)) throw new Error("Las horas no son válidas.");
   const days = datesBetween(from, to);
   const events: WorkEvent[] = [];
+  const entriesByFolio = new Map<string, Entry>();
+  const allLogEventsByEntrada = new Map<string, InternalLogEvent[]>();
 
   // Fetch warehouse entries by month, then filter each bitácora line by its
   // own embedded date/time. An entry can be created on a different day than
@@ -143,9 +203,15 @@ export async function workReport(connection: Connection, from: string, to: strin
   for (const month of months) {
     const entries = await queryAll(
       connection,
-      `SELECT folioOrden, folioAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5 AND mes = ${month}`,
+      `SELECT folioOrden, folioAlmEntrada, fechaAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5 AND mes = ${month}`,
     );
-    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.folioAlmEntrada, entry.bitacoraCantidadAdicional, from, to, fromHour, toHour)));
+    entries.forEach((entry) => {
+      if (!entry.folioAlmEntrada || !entry.folioOrden) return;
+      const typedEntry = entry as Entry;
+      entriesByFolio.set(typedEntry.folioAlmEntrada, typedEntry);
+      const logLines = logEvents(typedEntry.folioOrden, typedEntry.folioAlmEntrada, typedEntry.bitacoraCantidadAdicional, from, to, fromHour, toHour);
+      allLogEventsByEntrada.set(typedEntry.folioAlmEntrada, logLines);
+    });
   }
 
   for (const day of days) {
@@ -162,7 +228,11 @@ export async function workReport(connection: Connection, from: string, to: strin
   // An OP can have activity on a later day than its creation date. Fetch its
   // master record by folio so bitácora rows also receive product/description.
   const detailsByFolio = new Map<string, Pick<WorkEvent, "producto" | "descripcion">>();
-  for (const folioOrden of new Set(events.map((event) => event.folioOrden).filter(Boolean))) {
+  const foliosConActividad = [
+    ...events.map((event) => event.folioOrden),
+    ...[...allLogEventsByEntrada.values()].flatMap((logLines) => logLines.map((event) => event.folioOrden)),
+  ];
+  for (const folioOrden of new Set(foliosConActividad.filter(Boolean))) {
     if (!/^\d+$/.test(folioOrden)) continue;
     const details = await queryAll(
       connection,
@@ -180,26 +250,29 @@ export async function workReport(connection: Connection, from: string, to: strin
     if (details) events[index] = { ...event, ...details };
   });
 
-  const lotesByEntrada = new Map<string, Row[]>();
-  for (const folioAlmEntrada of new Set(events.map((event) => event.folioAlmEntrada).filter((folio): folio is string => Boolean(folio)))) {
-    if (!/^\d+$/.test(folioAlmEntrada)) continue;
-    lotesByEntrada.set(
-      folioAlmEntrada,
-      await queryAll(connection, `SELECT folioAlmEntrada, producto, cantidad, lotes FROM DbAlmEntradaDetLote WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND folioAlmEntrada = ${folioAlmEntrada}`),
-    );
+  // Allocate all the entry's bitácora lines, including lines outside the
+  // requested range, so a selected historic line does not reuse a pallet that
+  // belongs to a newer one. Output only the lines selected by the user.
+  for (const [folioAlmEntrada, logLines] of allLogEventsByEntrada) {
+    const selectedLines = logLines.filter((event) => event.enRango);
+    if (!selectedLines.length || !/^\d+$/.test(folioAlmEntrada)) continue;
+    const details = await queryAll(connection, `SELECT folioAlmEntrada, producto, cantidad, lotes FROM DbAlmEntradaDetLote WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND folioAlmEntrada = ${folioAlmEntrada}`);
+    const initialLots = allocateLots(details, logLines);
+    events.push(...selectedLines.map(({ timestamp: _timestamp, enRango: _enRango, ...event }) => ({ ...event, ...detailsByFolio.get(event.folioOrden) })));
+    if (initialLots.length) {
+      const entry = entriesByFolio.get(folioAlmEntrada);
+      const details = entry && detailsByFolio.get(entry.folioOrden);
+      events.push({
+        folioOrden: entry?.folioOrden ?? "",
+        folioAlmEntrada,
+        usuario: "—",
+        fechaHora: formatEntryDate(entry?.fechaAlmEntrada ?? null),
+        fuente: "Entrada inicial",
+        cantidadBitacora: initialLots.reduce((total, lot) => total + lot.cantidadAsignada, 0),
+        lotes: initialLots,
+        ...details,
+      });
+    }
   }
-
-  events.forEach((event, index) => {
-    if (!event.folioAlmEntrada || event.cantidadBitacora === undefined) return;
-    const details = lotesByEntrada.get(event.folioAlmEntrada);
-    if (details) events[index] = { ...event, pallets: palletAllocations(details, event.cantidadBitacora) };
-  });
-  const merged = new Map<string, WorkEvent>();
-  events.forEach((event) => {
-    const key = `${event.folioOrden}|${event.folioAlmEntrada ?? ""}|${event.usuario}|${event.fechaHora}|${event.cantidadBitacora ?? ""}`;
-    const previous = merged.get(key);
-    merged.set(key, previous ? { ...previous, fuente: previous.fuente === event.fuente ? event.fuente : "Bitácora" } : event);
-  });
-  return [...merged.values()].sort((a, b) => a.usuario.localeCompare(b.usuario) || a.folioOrden.localeCompare(b.folioOrden) || a.fechaHora.localeCompare(b.fechaHora));
+  return events.sort((a, b) => a.folioAlmEntrada?.localeCompare(b.folioAlmEntrada ?? "") || a.fechaHora.localeCompare(b.fechaHora) || a.usuario.localeCompare(b.usuario));
 }
-
