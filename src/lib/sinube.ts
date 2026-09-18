@@ -135,13 +135,22 @@ export async function workReport(connection: Connection, from: string, to: strin
   if (!/^\d{2}:\d{2}$/.test(fromHour) || !/^\d{2}:\d{2}$/.test(toHour)) throw new Error("Las horas no son válidas.");
   const days = datesBetween(from, to);
   const events: WorkEvent[] = [];
+
+  // Fetch warehouse entries by month, then filter each bitácora line by its
+  // own embedded date/time. An entry can be created on a different day than
+  // the work event recorded in bitacoraCantidadAdicional.
+  const months = new Set(days.map((day) => day.slice(0, 7).replace("-", "")));
+  for (const month of months) {
+    const entries = await queryAll(
+      connection,
+      `SELECT folioOrden, folioAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5 AND mes = ${month}`,
+    );
+    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.folioAlmEntrada, entry.bitacoraCantidadAdicional, from, to, fromHour, toHour)));
+  }
+
   for (const day of days) {
     const filter = `empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND dia = ${dayNumber(day)}`;
-    const [entries, orders] = await Promise.all([
-      queryAll(connection, `SELECT folioOrden, folioAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE ${filter} AND tipo = 5`),
-      queryAll(connection, `SELECT folioOrden, producto, descripcion, fechaCreacion, usuarioCreo FROM DbOrdenProduccion WHERE ${filter}`),
-    ]);
-    entries.forEach((entry) => events.push(...logEvents(entry.folioOrden ?? "", entry.folioAlmEntrada, entry.bitacoraCantidadAdicional, from, to, fromHour, toHour)));
+    const orders = await queryAll(connection, `SELECT folioOrden, producto, descripcion, fechaCreacion, usuarioCreo FROM DbOrdenProduccion WHERE ${filter}`);
     orders.forEach((order) => {
       const date = order.fechaCreacion && formattedOrderDate(order.fechaCreacion);
       if (!date || !order.usuarioCreo || !order.folioOrden || !inTimeRange(date, fromHour, toHour)) return;
