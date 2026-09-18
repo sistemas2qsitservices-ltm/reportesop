@@ -14,7 +14,13 @@ function connections(): Connection[] {
   try {
     const parsed: unknown = JSON.parse(value);
     if (!Array.isArray(parsed)) throw new Error();
-    return parsed as Connection[];
+    const sharedPassword = process.env.SINUBE_COMMUNICATION_PASSWORD;
+    return parsed.map((item) => {
+      const candidate = item as Omit<Connection, "communicationPassword"> & { communicationPassword?: string };
+      const communicationPassword = candidate.communicationPassword ?? sharedPassword;
+      if (!communicationPassword) throw new Error("Falta SINUBE_COMMUNICATION_PASSWORD o la contraseña de la conexión.");
+      return { ...candidate, communicationPassword };
+    });
   } catch {
     throw new Error("SINUBE_CONNECTIONS no contiene JSON válido.");
   }
