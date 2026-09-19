@@ -220,7 +220,7 @@ export async function workReport(connection: Connection, from: string, to: strin
   // below using their own embedded timestamp.
   const entries = await queryAll(
     connection,
-    `SELECT folioOrden, folioAlmEntrada, fechaAlmEntrada, bitacoraCantidadAdicional FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5`,
+    `SELECT folioOrden, folioAlmEntrada, fechaAlmEntrada, bitacoraCantidadAdicional, usuarioCreo FROM DbAlmEntrada WHERE empresa = ${sqlString(connection.rfc)} AND sucursal = ${sqlString(connection.branch)} AND tipo = 5`,
   );
   entries.forEach((entry) => {
     if (!entry.folioAlmEntrada || !entry.folioOrden) return;
@@ -287,7 +287,7 @@ export async function workReport(connection: Connection, from: string, to: strin
       events.push({
         folioOrden: entry?.folioOrden ?? "",
         folioAlmEntrada,
-        usuario: "—",
+        usuario: entry?.usuarioCreo?.replaceAll("\\@", "@") ?? "—",
         fechaHora: formatEntryDate(entry?.fechaAlmEntrada ?? null),
         fuente: "Entrada inicial",
         cantidadBitacora: initialLots.reduce((total, lot) => total + lot.cantidadAsignada, 0),
